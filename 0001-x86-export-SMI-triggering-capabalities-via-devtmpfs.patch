@@ -1,0 +1,192 @@
+From feec3ebdb89b6b7c594e0e4f68acd57e7db13971 Mon Sep 17 00:00:00 2001
+From: Seraphime Kirkovski <kirkseraph@gmail.com>
+Date: Wed, 21 Jun 2017 12:56:11 +0200
+Subject: [PATCH] x86: export SMI triggering capabalities via devtmpfs
+
+This adds a file "smi" under /dev/cpu/$NCPU, which when written to
+sends an IPI triggering an SMI to the respective core.
+
+Input values are ignored, except for "current" which sends an IPI
+to the currently executing CPU.
+
+Signed-off-by: Seraphime Kirkovski <kirkseraph@gmail.com>
+---
+ arch/x86/include/asm/ipi.h |   3 +
+ arch/x86/kernel/Makefile   |   1 +
+ arch/x86/kernel/smi.c      | 138 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 142 insertions(+)
+ create mode 100644 arch/x86/kernel/smi.c
+
+diff --git a/arch/x86/include/asm/ipi.h b/arch/x86/include/asm/ipi.h
+index a4fe16e42b7b..f7c48a6ff855 100644
+--- a/arch/x86/include/asm/ipi.h
++++ b/arch/x86/include/asm/ipi.h
+@@ -42,6 +42,9 @@ static inline unsigned int __prepare_ICR(unsigned int shortcut, int vector,
+ 	case NMI_VECTOR:
+ 		icr |= APIC_DM_NMI;
+ 		break;
++	case APIC_DM_SMI:
++		icr |= APIC_DM_SMI;
++		break;
+ 	}
+ 	return icr;
+ }
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 4b994232cb57..26b79c42a8fe 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -108,6 +108,7 @@ obj-$(CONFIG_PARAVIRT)		+= paravirt.o paravirt_patch_$(BITS).o
+ obj-$(CONFIG_PARAVIRT_SPINLOCKS)+= paravirt-spinlocks.o
+ obj-$(CONFIG_PARAVIRT_CLOCK)	+= pvclock.o
+ obj-$(CONFIG_X86_PMEM_LEGACY_DEVICE) += pmem.o
++obj-m				+= smi.o
+ 
+ obj-$(CONFIG_PCSPKR_PLATFORM)	+= pcspeaker.o
+ 
+diff --git a/arch/x86/kernel/smi.c b/arch/x86/kernel/smi.c
+new file mode 100644
+index 000000000000..9c0f3eea4a4b
+--- /dev/null
++++ b/arch/x86/kernel/smi.c
+@@ -0,0 +1,138 @@
++/*
++ * Copyright 2017 Seraphime Kirkovski
++ * Subject to the GPLv.2
++ *
++ * Module for triggering SMI's on a particular core
++ * Based on arch/x86/kernel/cpuid.c
++ *
++ * Inspired by Intel Software Developper Manual 3a 10.6.1
++ */
++
++#define pr_fmt(fmt) "smi: " fmt
++
++#include <asm/delay.h>
++#include <asm/ipi.h>
++
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/device.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/uaccess.h>
++
++#define SMI_MAJOR 73
++#define SMI_SHORTCUT_ALL 1
++#define SMI_SHORTCUT_ALLBUTSELF 2
++
++static struct class *smi_class;
++static enum cpuhp_state smi_cpuhp_state;
++
++static int __smi_issue(int cpu)
++{
++	pr_notice("Sending SMI IPI to cpu %d from %d\n",
++					cpu, raw_smp_processor_id());
++	apic->send_IPI(cpu, APIC_DM_SMI);
++	return 0;
++}
++
++static ssize_t smi_issue(struct file *file, const char __user *ubuff,
++				size_t size, loff_t *off)
++{
++	char buff[64];
++	bool do_current = false;
++	int cpu = -1, r;
++
++	r = simple_write_to_buffer(buff, sizeof(buff) - 1, off, ubuff, size);
++	if (r <= 0)
++		return r;
++	buff[r] = 0;
++
++	if (!strcmp(buff, "current")) {
++		preempt_disable();
++		cpu = smp_processor_id();
++		do_current = true;
++	}
++
++	get_online_cpus();
++	__smi_issue(cpu >= 0 ? cpu : iminor(file_inode(file)));
++	put_online_cpus();
++
++	if (do_current)
++		preempt_enable();
++
++	return r;
++}
++
++static const struct file_operations smi_fops = {
++	.owner = THIS_MODULE,
++	.write = smi_issue,
++};
++
++
++static int smi_device_create(unsigned int cpu)
++{
++	struct device *dev;
++
++	dev = device_create(smi_class, NULL, MKDEV(SMI_MAJOR, cpu), NULL,
++			    "cpu%d", cpu);
++	return PTR_ERR_OR_ZERO(dev);
++}
++
++static int smi_device_destroy(unsigned int cpu)
++{
++	device_destroy(smi_class, MKDEV(SMI_MAJOR, cpu));
++	return 0;
++}
++
++static char *smi_devnode(struct device *dev, umode_t *mode)
++{
++	return kasprintf(GFP_KERNEL, "cpu/%u/smi", MINOR(dev->devt));
++}
++
++static int __init smi_init(void)
++{
++	int r;
++
++	r = __register_chrdev(SMI_MAJOR, 0, NR_CPUS, "cpu/smi", &smi_fops);
++	if (r < 0) {
++		pr_err("Cannot regist chrdev for smi\n");
++		return r;
++	}
++
++	smi_class = class_create(THIS_MODULE, "smi");
++	if (IS_ERR(smi_class)) {
++		pr_err("cannot create smi class\n");
++		r = PTR_ERR(smi_class);
++		goto unreg_chrdev;
++	}
++	smi_class->devnode = smi_devnode;
++
++	smi_cpuhp_state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "x86/smi:online",
++				smi_device_create, smi_device_destroy);
++	if (smi_cpuhp_state <= 0) {
++		pr_err("cannot setup cpuhp state for smi\n");
++		r = smi_cpuhp_state;
++		goto destr_class;
++	}
++
++	return 0;
++destr_class:
++	class_destroy(smi_class);
++unreg_chrdev:
++	__unregister_chrdev(SMI_MAJOR, 0, NR_CPUS, "cpu/smi");
++	return r;
++}
++
++static void __exit smi_exit(void)
++{
++	cpuhp_remove_state(smi_cpuhp_state);
++	class_destroy(smi_class);
++	__unregister_chrdev(SMI_MAJOR, 0, NR_CPUS, "cpu/smi");
++}
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Seraphime Kirkovski <kirkseraph@gmail.com>");
++MODULE_DESCRIPTION("Expose an interface to issue SMIs via devtmpfs");
++module_init(smi_init);
++module_exit(smi_exit);
+-- 
+2.11.0
+
